@@ -43,7 +43,10 @@ describe("native clipboard timeout recovery", () => {
       token: "test-token",
     });
     expect(String(argv)).toContain("Number(pasteboard.changeCount) !== count");
-    expect(String(argv)).toContain("ObjC.unwrap(marker) === input.token");
+    expect(String(argv)).toContain("marker === input.token");
+    expect(String(argv)).toContain(
+      "var marker = ObjC.unwrap(pasteboard.stringForType('org.apple-mail-mcp.native-composition'))"
+    );
   });
   it("covers termination between clearing and flushing the ownership record", () => {
     expect(recoverNativeClipboard(snapshot, "test-token")).toBe(true);
@@ -98,8 +101,16 @@ describe("native clipboard timeout recovery", () => {
   function executeRecovery(
     marker: string | null,
     count: number,
-    options: { writeFails?: boolean; dataFails?: boolean; changeDuringRebuild?: boolean } = {}
+    options: {
+      writeFails?: boolean;
+      dataFails?: boolean;
+      changeDuringRebuild?: boolean;
+      wrappedNil?: boolean;
+    } = {}
   ) {
+    // JXA returns a missing pasteboard type as a wrapped nil object, which is
+    // truthy until unwrapped.
+    const nil = { isNil: () => true };
     let currentCount = count;
     const clear = vi.fn(() => currentCount++);
     const writtenItems: Array<Array<{ type: string; bytes: Buffer }>> = [];
@@ -115,7 +126,7 @@ describe("native clipboard timeout recovery", () => {
         clear();
         return currentCount;
       },
-      stringForType: () => marker,
+      stringForType: () => (marker === null && options.wrappedNil ? nil : marker),
       pasteboardItems: { count: marker ? 1 : 0 },
       writeObjects: write,
     };
@@ -124,7 +135,10 @@ describe("native clipboard timeout recovery", () => {
       const script = (argv as string[])[3];
       const input = String(spawnOptions!.input);
       const output = runInNewContext(script, {
-        ObjC: { import: () => undefined, unwrap: (value: unknown) => value },
+        ObjC: {
+          import: () => undefined,
+          unwrap: (value: unknown) => (value === nil ? undefined : value),
+        },
         $: {
           NSFileHandle: { fileHandleWithStandardInput: { readDataToEndOfFile: input } },
           NSString: { alloc: { initWithDataEncoding: () => ({ js: input }) } },
@@ -191,6 +205,13 @@ describe("native clipboard timeout recovery", () => {
     expect(result.writtenItems).toEqual([
       [{ type: "public.utf8-plain-text", bytes: Buffer.from("private", "utf8") }],
     ]);
+  });
+
+  it("restores an emptied clipboard when JXA reports the missing marker as a wrapped nil", () => {
+    const result = executeRecovery(null, 41, { wrappedNil: true });
+    expect(result.success).toBe(true);
+    expect(result.clear).toHaveBeenCalledOnce();
+    expect(result.write).toHaveBeenCalledOnce();
   });
 
   it.each([

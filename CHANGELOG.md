@@ -1,5 +1,11 @@
 ## [Unreleased]
 
+## [2.20.58] - 2026-11-11
+
+### Fixed
+
+- **Clipboard recovery after a killed editor run could leave the clipboard empty.** The recovery program tested the ownership marker before unwrapping it, and JXA returns a missing pasteboard type as a wrapped nil, which is truthy. A run stopped between clearing the clipboard and writing to it was therefore never recognised as its own, and the previous contents were not put back. The marker is now unwrapped first.
+
 ## [2.20.57] - 2026-11-11
 
 ### Added

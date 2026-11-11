@@ -100297,8 +100297,10 @@ try {
   var input = JSON.parse($.NSString.alloc.initWithDataEncoding(bytes, $.NSUTF8StringEncoding).js);
   var pasteboard = $.NSPasteboard.generalPasteboard;
   var count = Number(pasteboard.changeCount);
-  var marker = pasteboard.stringForType('org.apple-mail-mcp.native-composition');
-  var ownsWritten = marker && ObjC.unwrap(marker) === input.token &&
+  // Unwrap first: a missing type comes back as a wrapped nil, which is truthy
+  // in JXA and would make the cleared-but-unwritten case unrecoverable.
+  var marker = ObjC.unwrap(pasteboard.stringForType('org.apple-mail-mcp.native-composition'));
+  var ownsWritten = marker === input.token &&
     (input.ownedCount === null || count === input.ownedCount);
   var ownsCleared = !marker && Number(pasteboard.pasteboardItems.count) === 0 &&
     count === input.clearedCount;
