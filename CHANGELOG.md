@@ -1,5 +1,11 @@
 ## [Unreleased]
 
+## [2.20.58] - 2026-11-11
+
+### Fixed
+
+- **Native replies and forwards lost the sender's display name.** The sender was set to the bare address as the original message spelled it, so `Jane Doe <jane@example.com>` became `JANE@EXAMPLE.COM` when the correspondent had typed it in capitals (AppleScript matches text without regard to case). The match is now mapped back to the account's own address, and the sender is set to the account's `full name` with that address. The existing sender check is unchanged. If Mail does not accept that form, or the name contains `<`, `>` or `"`, the bare address is used as before.
+
 ## [2.20.57] - 2026-11-11
 
 ### Added

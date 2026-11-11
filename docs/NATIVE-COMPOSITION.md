@@ -51,7 +51,10 @@ for protocol metadata. Recovery data stays in memory and is not logged or
 written to a temporary file. A newer clipboard owner is never overwritten.
 
 New messages require an explicit `account`. Replies use the parent message's
-account and matching recipient identity, refusing an ambiguous sender. Native
+account and matching recipient identity, refusing an ambiguous sender. The
+reply's sender keeps the account's display name (its `full name` in Mail) and
+the account's own spelling of the address, even when the original message
+addressed it in different letter case. Native
 composition selects Mail.app even when SMTP is configured. Combining it with
 `transport: "smtp"` or caller-built threading headers is rejected. The default
 composition path and mail merge are unchanged.

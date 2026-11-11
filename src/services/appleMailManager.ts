@@ -582,20 +582,40 @@ const senderFragment = (compose: "theReply" | "theForward", verb: "reply" | "for
             end if
           end if`;
 
-/** Native composition must resolve an identity before opening a compose. */
+/**
+ * Native composition must resolve an identity before opening a compose.
+ * AppleScript `is`/`is in` ignore case, so a match against the parent's
+ * recipients (`JANE@EXAMPLE.COM` as the correspondent typed it) is mapped back
+ * to the account's own spelling, and the account's `full name` is kept with
+ * it: `_nativeSender` stays the bare address the checks compare, while
+ * `_nativeSenderFull` ("Full Name <address>") is what the compose gets.
+ */
 const nativeParentSender = `set _nativeAddresses to {}
+  set _nativeNames to {}
   set _nativeOwningAccount to missing value
   try
     set _nativeOwningAccount to account of (mailbox of msg)
   end try
   if _nativeOwningAccount is missing value then
-    repeat with _nativeAccount in (every account whose enabled is true)
-      set _nativeAddresses to _nativeAddresses & (email addresses of _nativeAccount)
-    end repeat
+    set _nativeAccounts to (every account whose enabled is true)
   else
     if enabled of _nativeOwningAccount is false then error "The original message account is disabled; no compose was created."
-    set _nativeAddresses to email addresses of _nativeOwningAccount
+    set _nativeAccounts to {_nativeOwningAccount}
   end if
+  repeat with _nativeAccountRef in _nativeAccounts
+    -- Dereference first: an address list read through a loop reference stays
+    -- an unresolvable object specifier inside a nested repeat.
+    set _nativeAccount to contents of _nativeAccountRef
+    set _nativeName to ""
+    try
+      set _nativeName to full name of _nativeAccount as text
+    end try
+    set _nativeAccountAddresses to (email addresses of _nativeAccount) as list
+    repeat with _nativeAddressIndex from 1 to count of _nativeAccountAddresses
+      set end of _nativeAddresses to (item _nativeAddressIndex of _nativeAccountAddresses) as text
+      set end of _nativeNames to _nativeName
+    end repeat
+  end repeat
   set _nativeMatches to {}
   repeat with _nativeRecipient in ((to recipients of msg) & (cc recipients of msg))
     set _nativeAddress to address of _nativeRecipient as text
@@ -611,7 +631,17 @@ const nativeParentSender = `set _nativeAddresses to {}
     set _nativeSender to item 1 of _nativeAddresses as text
   else
     error "Cannot uniquely resolve the native reply/forward sender; no compose was created."
-  end if`;
+  end if
+  set _nativeSenderFull to _nativeSender
+  repeat with _nativeIndex from 1 to count of _nativeAddresses
+    if (item _nativeIndex of _nativeAddresses) is _nativeSender then
+      set _nativeSender to item _nativeIndex of _nativeAddresses
+      set _nativeName to item _nativeIndex of _nativeNames
+      set _nativeSenderFull to _nativeSender
+      if _nativeName is not "" and _nativeName does not contain "<" and _nativeName does not contain ">" and _nativeName does not contain quote then set _nativeSenderFull to _nativeName & " <" & _nativeSender & ">"
+      exit repeat
+    end if
+  end repeat`;
 
 /** Length-prefixed addresses detect any recipient edit without delimiter ambiguity. */
 function nativeRecipientFingerprint(message: string): string {
@@ -4801,7 +4831,9 @@ ${indent}end try${this.sanitizeFragment("_uacct", indent)}${this.sanitizeFragmen
       if (options.kind) {
         creation = `${nativeParentSender}
           set _nativeMessage to ${options.kind} msg with opening window${options.kind === "reply" && options.replyAll ? " with reply to all" : ""}
-          set sender of _nativeMessage to _nativeSender`;
+          set sender of _nativeMessage to _nativeSenderFull
+          set _nativeActualSender to sender of _nativeMessage as text
+          if _nativeSenderFull is not _nativeSender and not (_nativeActualSender ends with "<" & _nativeSender & ">") then set sender of _nativeMessage to _nativeSender`;
       } else {
         creation = `set _nativeSender to "${escapeForAppleScript(pinnedAddress!)}"
           set _nativeMessage to make new outgoing message with properties {subject:"${escapeForAppleScript(options.subject ?? "")}", visible:true}

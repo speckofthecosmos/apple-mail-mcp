@@ -335,4 +335,76 @@ describe("native editor compose orchestration", () => {
     expect(script).not.toMatch(/content:|set content/);
     expect(script.match(/Native compose recipients changed/g)).toHaveLength(2);
   });
+
+  it.each(["reply", "forward"])(
+    "keeps the account's display name and own address casing on a native %s",
+    (kind) => {
+      expect(saveDraft(manager, kind).success).toBe(true);
+      const script = creation();
+      expect(script).toContain("set _nativeName to full name of _nativeAccount as text");
+      // A `repeat ... in` loop variable is a reference; reading its address
+      // list in a nested loop failed live ("Can't make item 1 of «class emad»
+      // ... into type text"), so the account is dereferenced first.
+      expect(script).toContain("repeat with _nativeAccountRef in _nativeAccounts");
+      expect(script).toContain("set _nativeAccount to contents of _nativeAccountRef");
+      expect(script).toContain(
+        "set _nativeAccountAddresses to (email addresses of _nativeAccount) as list"
+      );
+      expect(script).not.toMatch(/repeat with \w+ in \(email addresses of/);
+      expect(script.indexOf("contents of _nativeAccountRef")).toBeLessThan(
+        script.indexOf("full name of _nativeAccount")
+      );
+      expect(script).toContain("set sender of _nativeMessage to _nativeSenderFull");
+      expect(script).toContain('set _nativeSenderFull to _nativeName & " <" & _nativeSender & ">"');
+      // Mail ignoring the display-name form falls back to the bare address,
+      // and the unchanged sender check still runs before anything is returned.
+      expect(script).toContain("then set sender of _nativeMessage to _nativeSender");
+      expect(script).toContain(
+        'if not (_nativeActualSender is _nativeSender or _nativeActualSender ends with "<" & _nativeSender & ">") then error'
+      );
+      expect(script.indexOf("set sender of _nativeMessage to _nativeSenderFull")).toBeLessThan(
+        script.indexOf("Native compose sender verification failed")
+      );
+      expect(script).toContain(
+        'return "native-compose:" & (id of _nativeMessage as text) & linefeed & _nativeSender'
+      );
+    }
+  );
+
+  it.skipIf(process.platform !== "darwin")(
+    "maps a recipient-cased match to the account's own address and full name",
+    async () => {
+      // Plain AppleScript over fixture lists: no Mail or UI access. Plain lists
+      // are not Mail object specifiers, so this cannot catch reference bugs
+      // in reading the accounts (see the `contents of` assertions above).
+      saveDraft(manager, "reply");
+      const script = creation();
+      const mapping = script.slice(
+        script.indexOf("set _nativeSenderFull to _nativeSender"),
+        script.indexOf("set _nativeMessage to reply msg")
+      );
+      const { execFileSync } =
+        await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      const run = (name: string, sender: string) =>
+        execFileSync(
+          "/usr/bin/osascript",
+          [
+            "-e",
+            `set _nativeAddresses to {"other@example.com", "jane@example.com"}
+set _nativeNames to {"Other", ${JSON.stringify(name)}}
+set _nativeSender to ${JSON.stringify(sender)}
+${mapping}
+return _nativeSender & "|" & _nativeSenderFull`,
+          ],
+          { encoding: "utf8", timeout: 10000 }
+        ).trim();
+      expect(run("Jane Doe", "JANE@EXAMPLE.COM")).toBe(
+        "jane@example.com|Jane Doe <jane@example.com>"
+      );
+      expect(run("", "JANE@EXAMPLE.COM")).toBe("jane@example.com|jane@example.com");
+      expect(run('Odd "Quoted" Name', "jane@example.com")).toBe(
+        "jane@example.com|jane@example.com"
+      );
+    }
+  );
 });
