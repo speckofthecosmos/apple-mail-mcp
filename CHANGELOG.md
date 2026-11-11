@@ -1,5 +1,11 @@
 ## [Unreleased]
 
+## [2.20.58] - 2026-11-11
+
+### Fixed
+
+- **Native-editor focus could click outside Mail.** To focus the editor the bridge clicked the center of the message body's accessibility frame. That frame is the body's layout box, not what is on screen: in a small or tiled compose window (measured live at 464×336) the body runs past the window's bottom edge, and its center fell below every display, so the click landed on the Dock and opened the Applications stack. The focus check then stopped the run before any paste, so nothing was typed or sent, but every forward failed with `focus=role`. The click point is now the center of the part of the body that is visible inside its scroll areas, its window and a display (the display holding most of it). When no part at least 20×20 is visible, no mouse event is posted and the run fails with `focus=not-visible`.
+
 ## [2.20.57] - 2026-11-11
 
 ### Added

@@ -153,6 +153,52 @@ function address(value) {
   var text = String(value).trim(), match = text.match(/<([^<>]+)>$/);
   return (match ? match[1] : text).toLowerCase();
 }
+function intersect(a, b) {
+  if (!a || !b) return null;
+  var left = Math.max(a.x, b.x), top = Math.max(a.y, b.y);
+  var right = Math.min(a.x + a.w, b.x + b.w), bottom = Math.min(a.y + a.h, b.y + b.h);
+  return right > left && bottom > top ? {x: left, y: top, w: right - left, h: bottom - top} : null;
+}
+// The editor's AX frame is its layout box, not what is on screen. In a small or
+// tiled composer it runs past the window's bottom edge, and its center can fall
+// below every display, where a posted click lands on whatever is there (the
+// Dock, another app). Click only inside the part that is actually visible.
+function visibleClickPoint(body, clips, screens) {
+  var visible = body;
+  for (var i = 0; visible && i < clips.length; i++) visible = intersect(visible, clips[i]);
+  var best = null;
+  if (visible) screens.forEach(function (screen) {
+    var part = intersect(visible, screen);
+    if (part && (!best || part.w * part.h > best.w * best.h)) best = part;
+  });
+  return best && best.w >= 20 && best.h >= 20 ? {x: best.x + best.w / 2, y: best.y + best.h / 2} : null;
+}
+function frame(element) {
+  var position = attr(element, 'AXPosition'), size = attr(element, 'AXSize');
+  return position && size ? {x: position[0], y: position[1], w: size[0], h: size[1]} : null;
+}
+// The window plus every scroll area between it and the editor.
+function viewportClips(body, window) {
+  var clips = [frame(window)], element = body;
+  for (var depth = 0; depth < 30; depth++) {
+    element = attr(element, 'AXParent');
+    var role = element ? attr(element, 'AXRole') : null;
+    if (!role || role === 'AXWindow') break;
+    if (role === 'AXScrollArea') clips.push(frame(element));
+  }
+  return clips;
+}
+// Display frames in accessibility coordinates (top-left origin of the primary).
+function screenFrames() {
+  var screens = $.NSScreen.screens, result = [];
+  if (!screens.count) return result;
+  var primary = screens.objectAtIndex(0).frame.size.height;
+  for (var i = 0; i < screens.count; i++) {
+    var f = screens.objectAtIndex(i).frame;
+    result.push({x: f.origin.x, y: primary - f.origin.y - f.size.height, w: f.size.width, h: f.size.height});
+  }
+  return result;
+}
 function writeItems(clipboard, items) {
   var array = $.NSMutableArray.alloc.init;
   items.forEach(function (item) { array.addObject(item); });
@@ -216,11 +262,14 @@ function main(input) {
   // AXPress on Mail's WebArea is a no-op on some macOS versions. Click inside
   // the verified editor's live bounds, then verify actual keyboard focus.
   // Empty composers can place a floating Siri writing control at the body's
-  // top-left corner. Focus at the center; Cmd+Up below sets insertion to start.
-  var position = attr(body, 'AXPosition'), size = attr(body, 'AXSize');
-  if (!position || !size || size[0] < 20 || size[1] < 20 ||
-      !process.frontmost() || attr(window, 'AXMain') !== true) fail('focus');
-  var point = {x: position[0] + size[0] / 2, y: position[1] + size[1] / 2};
+  // top-left corner. Focus at the center of the visible editor; Cmd+Up below
+  // sets insertion to start.
+  if (!process.frontmost() || attr(window, 'AXMain') !== true) fail('focus');
+  var point = visibleClickPoint(frame(body), viewportClips(body, window), screenFrames());
+  if (!point) {
+    focusFailure = 'not-visible';
+    fail('focus');
+  }
   var down = $.CGEventCreateMouseEvent(null, 1, point, 0);
   var up = $.CGEventCreateMouseEvent(null, 2, point, 0);
   $.CGEventPost(0, down);
@@ -401,6 +450,7 @@ function diagnostic(stage: unknown, runtime: unknown, focus?: unknown, target?: 
       "size",
       "window-title",
       "subject",
+      "not-visible",
     ].includes(focus)
       ? `; focus=${focus}`
       : "";
