@@ -9856,7 +9856,7 @@ var require_transport = __commonJS({
     var { createRequire: createRequire2 } = __require("module");
     var { existsSync: existsSync8 } = __require("node:fs");
     var getCallers = require_caller();
-    var { join: join12, isAbsolute: isAbsolute2, sep: sep2 } = __require("node:path");
+    var { join: join12, isAbsolute: isAbsolute3, sep: sep2 } = __require("node:path");
     var { fileURLToPath: fileURLToPath2 } = __require("node:url");
     var sleep2 = require_atomic_sleep();
     var onExit = require_on_exit_leak_free();
@@ -9928,7 +9928,7 @@ var require_transport = __commonJS({
           return false;
         }
       }
-      return isAbsolute2(path3) && !existsSync8(path3);
+      return isAbsolute3(path3) && !existsSync8(path3);
     }
     function stripQuotes(value) {
       const first = value[0];
@@ -10046,7 +10046,7 @@ var require_transport = __commonJS({
       return buildStream(fixTarget(target), options, worker, sync, name2);
       function fixTarget(origin) {
         origin = bundlerOverrides[origin] || origin;
-        if (isAbsolute2(origin) || origin.indexOf("file://") === 0) {
+        if (isAbsolute3(origin) || origin.indexOf("file://") === 0) {
           return origin;
         }
         if (origin === "pino/file") {
@@ -100361,6 +100361,15 @@ function recoverNativeClipboard(output2, token) {
 
 // src/services/nativeMailComposer.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
+import { basename as basename2, isAbsolute as isAbsolute2 } from "node:path";
+var NATIVE_EDITOR_DEFAULT_TIMEOUT_MS = 6e4;
+var NATIVE_EDITOR_MIN_TIMEOUT_MS = 15e3;
+var NATIVE_EDITOR_ATTACHMENT_TIMEOUT_MS = 5e3;
+function nativeEditorTimeoutMs(attachments = 0) {
+  const configured = Number(process.env.APPLE_MAIL_MCP_NATIVE_EDITOR_TIMEOUT_MS);
+  const base2 = Number.isFinite(configured) && configured > 0 ? Math.max(NATIVE_EDITOR_MIN_TIMEOUT_MS, Math.floor(configured)) : NATIVE_EDITOR_DEFAULT_TIMEOUT_MS;
+  return base2 + attachments * NATIVE_EDITOR_ATTACHMENT_TIMEOUT_MS;
+}
 function renderNativeAuthoredBody(body) {
   const entities = {
     "&": "&amp;",
@@ -100415,13 +100424,19 @@ function preflight() {
 function attr(element, name) {
   try { return element.attributes.byName(name).value(); } catch (_) { return null; }
 }
+// Depth-first pre-order, which is document order: bodyText's readback compares
+// the editor's text by position (new prose first, Mail's content last). A
+// breadth-first walk orders by depth instead, so a shallow quoted line (Mail's
+// "<file.txt>" placeholder for a quoted attachment) was read before the prose.
 function descendants(root) {
   var result = [], pending = [root];
   while (pending.length) {
-    var element = pending.shift();
+    var element = pending.pop();
     result.push(element);
     if (result.length > 2000) fail('target');
-    try { pending = pending.concat(element.uiElements()); } catch (_) {}
+    var children = [];
+    try { children = element.uiElements(); } catch (_) {}
+    for (var i = children.length - 1; i >= 0; i--) pending.push(children[i]);
   }
   return result;
 }
@@ -100464,10 +100479,20 @@ function findMarkedComposer(process, input, checkMessage) {
   fail('target');
 }
 function normalized(value) { return String(value).normalize('NFC').replace(/\s+/g, ' ').trim(); }
-function verifiedInsertion(before, after, authored) {
-  var oldText = normalized(before), newText = normalized(after), added = normalized(authored);
-  return added.length > 0 && newText.length > oldText.length &&
-    newText === normalized(added + '\n' + oldText);
+function verifiedInsertion(before, after, authored, attachments) {
+  // Attachments surface in the editor's text as object-replacement characters.
+  function clean(value) { return normalized(String(value).replace(/\uFFFC/g, ' ')); }
+  var oldText = clean(before), newText = clean(after), added = clean(authored);
+  if (!attachments) {
+    return added.length > 0 && newText.length > oldText.length &&
+      newText === normalized(added + '\n' + oldText);
+  }
+  // Pasted files sit between the prose and Mail's existing signature/history and
+  // may also expose a file label, so require the prose first and every
+  // pre-existing character last, unchanged. Arrival is counted separately.
+  return newText.length >= oldText.length + added.length &&
+    newText.slice(0, added.length) === added &&
+    newText.slice(newText.length - oldText.length) === oldText;
 }
 function bodyText(body) {
   var direct = attr(body, 'AXValue');
@@ -100484,6 +100509,95 @@ function bodyText(body) {
 function address(value) {
   var text = String(value).trim(), match = text.match(/<([^<>]+)>$/);
   return (match ? match[1] : text).toLowerCase();
+}
+function escapeAttribute(value) {
+  return String(value).replace(/[&<>"']/g, function (c) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+  });
+}
+function mimeType(name) {
+  var dot = name.lastIndexOf('.');
+  if (dot > 0) {
+    try {
+      // UniformTypeIdentifiers has no JXA bridge; message the class directly.
+      var type = $.NSClassFromString('UTType').typeWithFilenameExtension(name.slice(dot + 1));
+      var mime = type.isNil() ? null : ObjC.unwrap(type.preferredMIMEType);
+      if (typeof mime === 'string' && mime) return mime;
+    } catch (_) {}
+  }
+  return 'application/octet-stream';
+}
+function dictionary(pairs) {
+  var result = $.NSMutableDictionary.alloc.init;
+  Object.keys(pairs).forEach(function (key) { result.setObjectForKey(pairs[key], key); });
+  return result;
+}
+// One com.apple.webarchive carries the prose and every file in a single paste.
+// Mail inserts each <attachment> from its subresource, whose data must be a
+// keyed-archived NSFileWrapper: raw file bytes display but fail at save. (A
+// separate file-URL item in the same paste makes Mail drop the text instead.)
+function webArchive(html, files) {
+  var markup = html, resources = $.NSMutableArray.alloc.init;
+  files.forEach(function (file) {
+    if (!file || typeof file.path !== 'string' || file.path.charAt(0) !== '/' ||
+        typeof file.name !== 'string' || !file.name) fail('attachments');
+    var data = $.NSData.dataWithContentsOfFile(file.path);
+    if (data.isNil()) fail('attachments');
+    var wrapper = $.NSFileWrapper.alloc.initRegularFileWithContents(data);
+    wrapper.preferredFilename = file.name;
+    var archived = $.NSKeyedArchiver.archivedDataWithRootObjectRequiringSecureCodingError(wrapper, false, null);
+    if (archived.isNil()) fail('attachments');
+    var id = ObjC.unwrap($.NSUUID.UUID.UUIDString), mime = mimeType(file.name);
+    markup += '<div><attachment webkitattachmentid="' + id + '" title="' + escapeAttribute(file.name) +
+      '" type="' + escapeAttribute(mime) + '"></attachment></div>';
+    resources.addObject(dictionary({
+      WebResourceURL: $('applewebdata://attachment/' + id),
+      WebResourceMIMEType: $(mime),
+      WebResourceData: archived
+    }));
+  });
+  var archive = $.NSPropertyListSerialization.dataWithPropertyListFormatOptionsError(dictionary({
+    WebMainResource: dictionary({
+      WebResourceData: $(markup).dataUsingEncoding($.NSUTF8StringEncoding),
+      WebResourceMIMEType: $('text/html'),
+      WebResourceTextEncodingName: $('UTF-8'),
+      WebResourceURL: $('about:blank'),
+      WebResourceFrameName: $('')
+    }),
+    WebSubresources: resources
+  }), $.NSPropertyListBinaryFormat_v1_0, 0, null);
+  if (archive.isNil()) fail('attachments');
+  return archive;
+}
+// Mail's scripting attachment count reads a quote-less copy of the message that
+// never sees pasted files. The editor exposes each attachment as an AXButton
+// described "<file name>, <size>", e.g. "report.pdf, 2.4 MB".
+function attachmentButtons(body, names) {
+  var counts = {};
+  names.forEach(function (name) { counts[name] = 0; });
+  descendants(body).forEach(function (element) {
+    if (attr(element, 'AXRole') !== 'AXButton') return;
+    var description = attr(element, 'AXDescription');
+    if (typeof description !== 'string') return;
+    description = description.normalize('NFC');
+    Object.keys(counts).forEach(function (name) {
+      if (description.indexOf(name.normalize('NFC') + ', ') === 0) counts[name]++;
+    });
+  });
+  return counts;
+}
+function waitForAttachments(body, names, baseline) {
+  var expected = {};
+  names.forEach(function (name) {
+    expected[name] = (expected.hasOwnProperty(name) ? expected[name] : baseline[name]) + 1;
+  });
+  var deadline = Date.now() + 10000;
+  for (;;) {
+    var counts = attachmentButtons(body, names);
+    if (Object.keys(expected).every(function (name) { return counts[name] >= expected[name]; })) return;
+    if (Date.now() >= deadline) fail('attachment-arrival');
+    delay(0.25);
+  }
 }
 function writeItems(clipboard, items) {
   var array = $.NSMutableArray.alloc.init;
@@ -100581,8 +100695,18 @@ function main(input) {
     fail('focus');
   }
   checkFocus();
-  if (!normalized(input.body)) return;
+  var files = Array.isArray(input.attachments) ? input.attachments : [];
+  var prose = Boolean(normalized(input.body));
+  if (!prose && !files.length) return;
   var beforeText = bodyText(body);
+  var names = [], attachmentBaseline = null, archive = null;
+  if (files.length) {
+    stage('attachments');
+    archive = webArchive(prose ? input.html : '', files);
+    names = files.map(function (file) { return file.name; });
+    // A forward's own attachments or a quoted file can share a pasted name.
+    attachmentBaseline = attachmentButtons(body, names);
+  }
   stage('clipboard-snapshot');
   var clipboard = $.NSPasteboard.generalPasteboard;
   var recovery = snapshotClipboard(clipboard, input.recoveryToken);
@@ -100592,8 +100716,10 @@ function main(input) {
   {
     stage('clipboard-write');
     var authored = $.NSPasteboardItem.alloc.init;
-    if (!authored.setStringForType(input.html, $.NSPasteboardTypeHTML) ||
-        !authored.setStringForType(input.body, $.NSPasteboardTypeString) ||
+    // HTML and text stay as fallbacks; Mail prefers the archive when present.
+    if ((prose && (!authored.setStringForType(input.html, $.NSPasteboardTypeHTML) ||
+        !authored.setStringForType(input.body, $.NSPasteboardTypeString))) ||
+        (archive && !authored.setDataForType(archive, 'com.apple.webarchive')) ||
         !authored.setStringForType('', 'org.nspasteboard.TransientType') ||
         !authored.setStringForType('', 'org.nspasteboard.AutoGeneratedType') ||
         !authored.setStringForType(input.recoveryToken, 'org.apple-mail-mcp.native-composition')) fail('clipboard');
@@ -100605,8 +100731,12 @@ function main(input) {
     ownedCount = Number(clipboard.changeCount);
     emit({kind: 'clipboard-owned', count: ownedCount});
     if (!wrote) fail('clipboard');
-    if (ObjC.unwrap(clipboard.stringForType($.NSPasteboardTypeHTML)) !== input.html ||
-        ObjC.unwrap(clipboard.stringForType($.NSPasteboardTypeString)) !== input.body) fail('clipboard');
+    if (prose && (ObjC.unwrap(clipboard.stringForType($.NSPasteboardTypeHTML)) !== input.html ||
+        ObjC.unwrap(clipboard.stringForType($.NSPasteboardTypeString)) !== input.body)) fail('clipboard');
+    if (archive) {
+      var written = clipboard.dataForType('com.apple.webarchive');
+      if (written.isNil() || !written.isEqualToData(archive)) fail('clipboard');
+    }
     stage('pre-cmd-up');
     checkFocus();
     events.keyCode(126, {using: ['command down']});
@@ -100616,11 +100746,15 @@ function main(input) {
     stage('paste');
     events.keyCode(9, {using: ['command down']});
     // UI dispatch may finish before AX updates. Wait once, never paste twice.
-    delay(0.3);
+    delay(files.length ? 1 : 0.3);
     stage('readback');
     checkFocus();
     if (Number(clipboard.changeCount) !== ownedCount) fail('clipboard');
-    if (!verifiedInsertion(beforeText, bodyText(body), input.body)) fail('readback');
+    if (!verifiedInsertion(beforeText, bodyText(body), input.body, files.length)) fail('readback');
+    if (files.length) {
+      stage('attachment-arrival');
+      waitForAttachments(body, names, attachmentBaseline);
+    }
   }
   // The parent owns restoration, including after a timeout. A child cannot
   // safely recover from being killed halfway through its own restoration.
@@ -100631,7 +100765,7 @@ try {
   main(JSON.parse(text));
   JSON.stringify({success: true});
 } catch (error) {
-  var allowed = ['accessibility', 'automation', 'automation-unavailable', 'identity', 'target', 'focus', 'clipboard', 'restore', 'readback', 'paste-unavailable'];
+  var allowed = ['accessibility', 'automation', 'automation-unavailable', 'identity', 'target', 'focus', 'clipboard', 'restore', 'readback', 'paste-unavailable', 'attachments', 'attachment-arrival'];
   JSON.stringify({success: false, code: allowed.indexOf(error.message) >= 0 ? error.message : 'bridge',
     stage: currentStage, focus: focusFailure || undefined, target: targetFailure || undefined,
     runtime: typeof error.errorNumber === 'number' ? error.errorNumber : undefined});
@@ -100648,9 +100782,11 @@ var ERRORS = {
   restore: "Native Mail composition could not restore the previous clipboard; nothing was sent.",
   "paste-unavailable": "Mail's Paste command is unavailable for the verified editor; nothing was sent.",
   readback: "Native Mail composition could not verify the inserted prose; nothing was sent.",
+  attachments: "Native Mail composition could not read or package an attachment for the editor; nothing was sent.",
+  "attachment-arrival": "The pasted attachments did not appear in the composer; nothing was sent. Inspect the marked draft before retrying.",
   bridge: "Native Mail composition failed; nothing was sent. Inspect the marked draft and clipboard before retrying."
 };
-function runNativeEditor(payload) {
+function runNativeEditor(payload, timeout) {
   try {
     const result = spawnSync3(
       "/usr/bin/osascript",
@@ -100658,7 +100794,7 @@ function runNativeEditor(payload) {
       {
         input: JSON.stringify(payload),
         encoding: "utf8",
-        timeout: 15e3,
+        timeout,
         killSignal: "SIGKILL",
         maxBuffer: MAX_NATIVE_EDITOR_OUTPUT_BYTES,
         stdio: ["pipe", "pipe", "pipe"]
@@ -100677,7 +100813,8 @@ function runNativeEditor(payload) {
       };
     }
     const response = JSON.parse(result.stdout.trim().split("\n").at(-1) ?? "");
-    return response.success === true ? { success: true } : {
+    if (response.success === true) return { success: true };
+    return {
       success: false,
       error: (ERRORS[response.code] ?? ERRORS.bridge) + diagnostic(response.stage, response.runtime, response.focus, response.target)
     };
@@ -100693,12 +100830,14 @@ function diagnostic(stage, runtime, focus, target) {
     "target-window",
     "target-body",
     "focus",
+    "attachments",
     "clipboard-snapshot",
     "clipboard-write",
     "pre-cmd-up",
     "post-cmd-up",
     "paste",
     "readback",
+    "attachment-arrival",
     "clipboard-restore"
   ];
   if (typeof stage !== "string" || !stages.includes(stage)) return "";
@@ -100726,20 +100865,28 @@ function diagnostic(stage, runtime, focus, target) {
   return ` [stage=${stage}${detail}${focusDetail}${targetDetail}]`;
 }
 function nativeEditorPreflight() {
-  return runNativeEditor({ operation: "preflight" });
+  return runNativeEditor({ operation: "preflight" }, NATIVE_EDITOR_MIN_TIMEOUT_MS);
 }
 function insertNativeAuthoredBody(input2) {
   if (!Number.isSafeInteger(input2.messageId) || input2.messageId < 0 || typeof input2.markerSubject !== "string" || !input2.markerSubject || typeof input2.expectedSender !== "string" || !input2.expectedSender || typeof input2.body !== "string") {
     return { success: false, error: ERRORS.identity };
   }
+  const paths = input2.attachments ?? [];
+  if (!paths.every((path3) => typeof path3 === "string" && isAbsolute2(path3) && basename2(path3))) {
+    return { success: false, error: ERRORS.attachments };
+  }
   const body = input2.body.normalize("NFC").replace(/\r\n?/g, "\n");
-  return runNativeEditor({
-    ...input2,
-    body,
-    recoveryToken: randomUUID2(),
-    operation: "insert",
-    html: renderNativeAuthoredBody(body)
-  });
+  return runNativeEditor(
+    {
+      ...input2,
+      body,
+      attachments: paths.map((path3) => ({ path: path3, name: basename2(path3) })),
+      recoveryToken: randomUUID2(),
+      operation: "insert",
+      html: renderNativeAuthoredBody(body)
+    },
+    nativeEditorTimeoutMs(paths.length)
+  );
 }
 
 // src/services/appleMailManager.ts
@@ -100973,7 +101120,7 @@ import {
   statSync as statSync3,
   unlinkSync as unlinkSync2
 } from "fs";
-import { basename as basename2, dirname as dirname3, join as join7 } from "path";
+import { basename as basename3, dirname as dirname3, join as join7 } from "path";
 import { homedir as homedir5 } from "os";
 var BODY_INDEX_FILE_ENV = "APPLE_MAIL_MCP_BODY_INDEX_FILE";
 var BODY_INDEX_APPLICATION_ID = 1095582281;
@@ -101014,7 +101161,7 @@ function messageIdFromFilename(name2) {
   return m ? Number(m[1]) : null;
 }
 function inMessagesFolder(dir) {
-  return basename2(dir) === "Messages";
+  return basename3(dir) === "Messages";
 }
 function parseEmlxBody(bytes) {
   const source = emlxSource(bytes);
@@ -101553,7 +101700,7 @@ var BodyIndexWriter = class _BodyIndexWriter {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const path3 of paths) {
-        const name2 = basename2(path3);
+        const name2 = basename3(path3);
         const id = messageIdFromFilename(name2);
         if (id === null || !inMessagesFolder(dirname3(path3))) continue;
         let st;
@@ -105868,8 +106015,9 @@ ${indent}end try${this.sanitizeFragment("_uacct", indent)}${this.sanitizeFragmen
     }
   }
   /**
-   * Native editor transaction: create once, paste only the authored HTML, then
-   * re-identify and finalize once. Any failure leaves the compose for inspection.
+   * Native editor transaction: create once, paste only the authored HTML (and
+   * any attachments, in the same paste), then re-identify and finalize once.
+   * Any failure leaves the compose for inspection.
    * Neither creation nor finalization assigns Mail's body/content property.
    */
   composeNative(mode, body, attachments, options) {
@@ -105890,13 +106038,6 @@ ${indent}end try${this.sanitizeFragment("_uacct", indent)}${this.sanitizeFragmen
     }
     const mat = materializeAttachments(attachments);
     try {
-      const appendCommands = buildAttachmentCommands(mat.paths);
-      const attachmentCommands = mat.paths.length ? `set _nativeExpectedAttachments to (count of attachments of content of _nativeMessage) + ${mat.paths.length}
-          tell _nativeMessage
-            ${appendCommands}
-          end tell
-          ${attachmentSettleBlock("_nativeMessage", mat.paths.length).replace(`attachCount >= ${mat.paths.length}`, "attachCount >= _nativeExpectedAttachments")}
-          if attachCount < _nativeExpectedAttachments then error "Native attachments did not finish loading; compose retained."` : "";
       const marker = `MCP Native ${randomUUID3()}`;
       const endMarker = `:native-end:${randomUUID3()}`;
       const safeMarker = escapeForAppleScript(marker);
@@ -105956,7 +106097,8 @@ end try`
         messageId,
         markerSubject: marker,
         body,
-        expectedSender
+        expectedSender,
+        ...mat.paths.length ? { attachments: mat.paths } : {}
       });
       if (!inserted.success) return inserted;
       const guard = `set _nativeMatches to (every outgoing message whose id is ${messageId})
@@ -105970,8 +106112,6 @@ end try`
       const finalized = executeAppleScript(
         buildAppLevelScript(`try
         ${guard}
-        ${attachmentCommands}
-        ${mat.paths.length ? guard : ""}
         set subject of _nativeMessage to (${nativeTextLiteral(originalSubject)})
         ${mode === "send" ? 'set _nativeSent to send _nativeMessage\nif _nativeSent is not true then error "Mail did not accept the native send; inspect the compose before retrying."' : draftSaveBlock("_nativeMessage")}
         return "native-finalized"
@@ -111117,7 +111257,7 @@ var SMTP_DELIVERY_SCHEMA = {
   rejected: external_exports.array(external_exports.string()).optional().describe("Recipients rejected by the SMTP server.")
 };
 var COMPOSITION_SCHEMA = external_exports.literal("native-editor").optional().describe(
-  "Opt in to Mail's visible native editor: inserts only new prose, preserving its signature, HTML quotation and reply ancestry without the AppleScript content setter. Requires an unlocked desktop and existing Accessibility and Automation permissions. Uses Mail.app even when SMTP is configured; cannot be combined with transport=smtp or caller-built threading headers. New messages require an explicit account. Do not interact with Mail or the clipboard while it runs. Failure never falls back to another composition method or sends an unverified message."
+  "Opt in to Mail's visible native editor: inserts only new prose (and any attachments, pasted below it), preserving its signature, HTML quotation and reply ancestry without the AppleScript content setter. Requires an unlocked desktop and existing Accessibility and Automation permissions. Uses Mail.app even when SMTP is configured; cannot be combined with transport=smtp or caller-built threading headers. New messages require an explicit account. Do not interact with Mail or the clipboard while it runs. Failure never falls back to another composition method or sends an unverified message."
 );
 var SEND_ACCOUNT_SCHEMA = external_exports.string().optional().describe(
   "Account to send from. AppleScript transport: a Mail account name or an exact sender address, resolved to one address and verified before sending; if it matches no enabled account, or Mail would use a different sender, nothing is sent and an error is returned. Omitted \u2192 Mail's default sender (reported back in `from`). SMTP transport: an email-form From override (see README)."

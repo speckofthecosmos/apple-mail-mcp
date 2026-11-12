@@ -64,6 +64,14 @@ body focus. The sender, subject, and recipients are checked again before saving
 or sending. The temporary subject is then restored. Clipboard contents are
 restored unless another application has changed them in the meantime.
 
+Locating the composer and reading the body back goes through Accessibility,
+and each attribute read costs roughly 20 ms in Mail's composer. A reply with a
+long quoted history and an HTML signature can take close to 30 seconds. Each
+editor run is therefore bounded at 60 seconds by default, plus 5 seconds per
+attachment; set `APPLE_MAIL_MCP_NATIVE_EDITOR_TIMEOUT_MS` (minimum `15000`) to
+change the base. A run that hits the bound is stopped, and the clipboard is
+restored if this operation still owns it.
+
 Drafts close only after Mail confirms a new stored draft ID for the restored
 subject. If confirmation does not arrive within ten seconds, the operation
 reports failure and leaves the composer open rather than risking a lost draft.
@@ -72,6 +80,44 @@ A failed operation is not retried or rerouted. A partially composed draft may
 remain open for inspection. A process crash can prevent clipboard restoration;
 inspect the clipboard and draft before retrying. If final delivery is uncertain,
 check Sent and Outbox first to avoid duplicates.
+
+## Attachments
+
+`attachments` are inserted by the same verified paste as the prose, directly
+below it and above the signature and quoted history. With an empty `body`, only
+the files are pasted, at the top of the message. Mail's scripting attachment
+count cannot see pasted files, so the editor is checked instead: Mail shows
+each attachment in the accessibility tree as a button described
+`<file name>, <size>`. The buttons for each pasted name are counted before the
+paste, and after the prose is verified the server waits up to 10 seconds for
+one more per pasted file. If they do not appear, the message is neither saved
+nor sent, and the composer stays open.
+
+Why a paste. Mail's AppleScript `make new attachment` writes the outgoing
+message's scripting `content`. Mail builds that text without the quoted
+history, and any write to it re-renders the whole HTML body from it. Every
+insertion point tried, at the end, at the start, or inside `content`, erased the
+pasted prose and Mail's quotation and left only the signature, while the
+command still reported success. Changing the subject or sender by AppleScript
+does not touch the body.
+
+The paste carries one pasteboard item with a `com.apple.webarchive` type. The
+HTML and plain-text types are kept on the same item as fallbacks. The archive
+is a binary property list:
+
+- `WebMainResource`: the escaped prose HTML followed, per file, by
+  `<div><attachment webkitattachmentid="UUID" title="NAME" type="MIME"></attachment></div>`,
+  with MIME type `text/html`, encoding `UTF-8` and URL `about:blank`.
+- `WebSubresources`: one entry per file, with URL
+  `applewebdata://attachment/UUID`, the file's MIME type, and as data an
+  `NSKeyedArchiver` archive of an `NSFileWrapper` that holds the file's bytes
+  and its name. Raw file bytes are not enough: the editor shows the
+  attachment, but Mail fails it when the message is saved.
+
+A file URL placed beside the HTML in the same paste makes Mail insert only the
+file and drop the text, which is why the files travel inside the archive. The
+same route can carry any other content that should enter Mail's editor through
+its own paste handling.
 
 ## Standalone prose renderer
 

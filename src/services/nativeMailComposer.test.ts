@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runInNewContext } from "node:vm";
 
 const h = vi.hoisted(() => ({ run: vi.fn() }));
@@ -7,6 +7,10 @@ vi.mock("node:child_process", () => ({ spawnSync: h.run }));
 import {
   insertNativeAuthoredBody,
   nativeEditorPreflight,
+  nativeEditorTimeoutMs,
+  NATIVE_EDITOR_ATTACHMENT_TIMEOUT_MS,
+  NATIVE_EDITOR_DEFAULT_TIMEOUT_MS,
+  NATIVE_EDITOR_MIN_TIMEOUT_MS,
   renderNativeAuthoredBody,
 } from "./nativeMailComposer.js";
 import {
@@ -162,16 +166,331 @@ describe("native editor process contract (no live UI)", () => {
     expect(JSON.stringify(argv)).not.toContain(input.body);
     expect(JSON.stringify(argv)).not.toContain(input.expectedSender);
     expect(options).toMatchObject({
-      timeout: 15000,
+      timeout: NATIVE_EDITOR_DEFAULT_TIMEOUT_MS,
       killSignal: "SIGKILL",
       maxBuffer: MAX_NATIVE_EDITOR_OUTPUT_BYTES,
     });
     expect(MAX_NATIVE_EDITOR_OUTPUT_BYTES).toBeGreaterThan(MAX_NATIVE_CLIPBOARD_SNAPSHOT_BYTES);
     expect(JSON.parse(options.input)).toEqual({
       ...input,
+      attachments: [],
       operation: "insert",
       recoveryToken: expect.any(String),
       html: renderNativeAuthoredBody(input.body),
+    });
+  });
+
+  describe("subprocess timeout", () => {
+    const key = "APPLE_MAIL_MCP_NATIVE_EDITOR_TIMEOUT_MS";
+    const saved = process.env[key];
+    afterEach(() => {
+      if (saved === undefined) delete process.env[key];
+      else process.env[key] = saved;
+    });
+
+    it("defaults to 60 s, far above a measured 28.7 s reply with a long quoted history", () => {
+      delete process.env[key];
+      expect(NATIVE_EDITOR_DEFAULT_TIMEOUT_MS).toBe(60000);
+      expect(nativeEditorTimeoutMs()).toBe(60000);
+      expect(nativeEditorTimeoutMs(2)).toBe(60000 + 2 * NATIVE_EDITOR_ATTACHMENT_TIMEOUT_MS);
+    });
+
+    it.each([
+      ["120000", 120000],
+      ["1000", NATIVE_EDITOR_MIN_TIMEOUT_MS],
+      ["0", NATIVE_EDITOR_DEFAULT_TIMEOUT_MS],
+      ["-5", NATIVE_EDITOR_DEFAULT_TIMEOUT_MS],
+      ["soon", NATIVE_EDITOR_DEFAULT_TIMEOUT_MS],
+    ])("reads %s from the environment as %d ms", (value, expected) => {
+      process.env[key] = value;
+      expect(nativeEditorTimeoutMs()).toBe(expected);
+    });
+
+    it("applies the configured base plus the per-attachment allowance to the insert run", () => {
+      process.env[key] = "90000";
+      insertNativeAuthoredBody({ ...input, attachments: ["/tmp/a.pdf", "/tmp/b.txt"] });
+      expect(h.run.mock.calls[0][2].timeout).toBe(90000 + 2 * NATIVE_EDITOR_ATTACHMENT_TIMEOUT_MS);
+    });
+
+    it("keeps the short bound for the permission preflight", () => {
+      process.env[key] = "90000";
+      nativeEditorPreflight();
+      expect(h.run.mock.calls[0][2].timeout).toBe(NATIVE_EDITOR_MIN_TIMEOUT_MS);
+    });
+  });
+
+  it("passes attachments to the bridge as absolute paths with their file names", () => {
+    insertNativeAuthoredBody({ ...input, attachments: ["/Users/me/Reports/Q3 report.pdf"] });
+    const [, argv, options] = h.run.mock.calls[0];
+    expect(JSON.stringify(argv)).not.toContain("Q3 report.pdf");
+    expect(JSON.parse(options.input).attachments).toEqual([
+      { path: "/Users/me/Reports/Q3 report.pdf", name: "Q3 report.pdf" },
+    ]);
+  });
+
+  it("refuses a relative attachment path before starting a subprocess", () => {
+    const result = insertNativeAuthoredBody({ ...input, attachments: ["report.pdf"] });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("attachment");
+    expect(h.run).not.toHaveBeenCalled();
+  });
+
+  it("pastes prose and files once, from one item carrying a web archive", () => {
+    insertNativeAuthoredBody({ ...input, attachments: ["/tmp/a.pdf"] });
+    const script = h.run.mock.calls[0][1][3];
+    expect(script.match(/events\.keyCode\(9,/g)).toHaveLength(1);
+    expect(script.match(/writeItems\(clipboard, \[/g)).toHaveLength(1);
+    expect(script).toContain("authored.setDataForType(archive, 'com.apple.webarchive')");
+    expect(script).toContain("written.isEqualToData(archive)");
+    expect(script).toContain("archivedDataWithRootObjectRequiringSecureCodingError(wrapper");
+    expect(script).not.toMatch(
+      /public\.file-url|make new attachment|\.content\s*=|set content|attachments\.length/
+    );
+    // The archive and the accessibility baseline happen before the clipboard is
+    // touched; arrival is awaited after the prose readback, before success.
+    expect(script.indexOf("archive = webArchive(")).toBeLessThan(
+      script.indexOf("stage('clipboard-snapshot')")
+    );
+    expect(script.indexOf("attachmentBaseline = attachmentButtons(body, names)")).toBeLessThan(
+      script.indexOf("stage('clipboard-snapshot')")
+    );
+    expect(script.indexOf("fail('readback')", script.indexOf("stage('readback')"))).toBeLessThan(
+      script.indexOf("waitForAttachments(body, names, attachmentBaseline)")
+    );
+    expect(script.indexOf("waitForAttachments(body, names, attachmentBaseline)")).toBeLessThan(
+      script.indexOf("JSON.stringify({success: true})")
+    );
+  });
+
+  describe("attachment arrival in the accessibility tree", () => {
+    const button = (description: unknown) => ({ AXRole: "AXButton", AXDescription: description });
+    const helper = () => {
+      insertNativeAuthoredBody(input);
+      const script = h.run.mock.calls[0][1][3];
+      return script.slice(
+        script.indexOf("function attachmentButtons"),
+        script.indexOf("function writeItems")
+      );
+    };
+    const run = (
+      observations: unknown[][],
+      names: string[],
+      baseline: Record<string, number>,
+      step = 1000
+    ) => {
+      let poll = 0;
+      let now = 0;
+      const delay = vi.fn(() => {
+        now += step;
+      });
+      const context = {
+        names,
+        baseline,
+        delay,
+        descendants: () => observations[Math.min(poll++, observations.length - 1)],
+        attr: (element: Record<string, unknown>, key: string) => element[key] ?? null,
+        fail: (code: string) => {
+          throw new Error(code);
+        },
+        Date: { now: () => now },
+      };
+      runInNewContext(`${helper()}\nwaitForAttachments({}, names, baseline);`, context);
+      return { delay, polls: poll };
+    };
+
+    it("returns once each pasted file shows up as a described button", () => {
+      const result = run(
+        [[], [button("report.pdf, 2.4 MB"), { AXRole: "AXStaticText", AXValue: "Prose" }]],
+        ["report.pdf"],
+        { "report.pdf": 0 }
+      );
+      expect(result.polls).toBe(2);
+      expect(result.delay).toHaveBeenCalledOnce();
+    });
+
+    it("counts on top of a same-named attachment that was already there", () => {
+      expect(() =>
+        run([[button("report.pdf, 2.4 MB")]], ["report.pdf"], { "report.pdf": 1 })
+      ).toThrow("attachment-arrival");
+      expect(
+        run([[button("report.pdf, 2.4 MB"), button("report.pdf, 2.4 MB")]], ["report.pdf"], {
+          "report.pdf": 1,
+        }).polls
+      ).toBe(1);
+    });
+
+    it("requires one button per pasted copy of a repeated name", () => {
+      expect(() => run([[button("a.pdf, 1 KB")]], ["a.pdf", "a.pdf"], { "a.pdf": 0 })).toThrow(
+        "attachment-arrival"
+      );
+      expect(
+        run([[button("a.pdf, 1 KB"), button("a.pdf, 1 KB")]], ["a.pdf", "a.pdf"], { "a.pdf": 0 })
+          .polls
+      ).toBe(1);
+    });
+
+    it("ignores other roles, other names, and a name without the size suffix", () => {
+      expect(() =>
+        run(
+          [
+            [
+              { AXRole: "AXStaticText", AXDescription: "report.pdf, 2.4 MB" },
+              button("xreport.pdf, 2.4 MB"),
+              button("report.pdf"),
+              button(null),
+            ],
+          ],
+          ["report.pdf"],
+          { "report.pdf": 0 }
+        )
+      ).toThrow("attachment-arrival");
+    });
+
+    it("matches a decomposed (NFD) description to the precomposed name", () => {
+      expect(
+        run([[button("Bericht-a\u0308.pdf, 3 KB")]], ["Bericht-\u00e4.pdf"], {
+          "Bericht-\u00e4.pdf": 0,
+        }).polls
+      ).toBe(1);
+    });
+
+    it("gives up after the bounded wait with its own error code", () => {
+      const result = (() => {
+        try {
+          run([[]], ["report.pdf"], { "report.pdf": 0 }, 250);
+        } catch (error) {
+          return (error as Error).message;
+        }
+      })();
+      expect(result).toBe("attachment-arrival");
+    });
+
+    it("reports the arrival failure distinctly and without file names", () => {
+      h.run.mockReturnValue({
+        status: 0,
+        stdout: JSON.stringify({
+          success: false,
+          code: "attachment-arrival",
+          stage: "attachment-arrival",
+        }),
+      });
+      const error = insertNativeAuthoredBody({ ...input, attachments: ["/tmp/secret.pdf"] }).error;
+      expect(error).toContain("The pasted attachments did not appear in the composer");
+      expect(error).toContain("[stage=attachment-arrival]");
+      expect(error).not.toContain("secret.pdf");
+    });
+  });
+
+  it.skipIf(process.platform !== "darwin")(
+    "builds a web archive whose attachment data is a keyed-archived file wrapper",
+    async () => {
+      // Pure Foundation: no pasteboard, Mail, or UI access.
+      insertNativeAuthoredBody(input);
+      const script = h.run.mock.calls[0][1][3];
+      const helper = script.slice(
+        script.indexOf("function escapeAttribute"),
+        script.indexOf("function writeItems")
+      );
+      const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+      const { tmpdir } = await import("node:os");
+      const { join } = await import("node:path");
+      const dir = mkdtempSync(join(tmpdir(), "amcp-webarchive-"));
+      const file = join(dir, "fixture.pdf");
+      writeFileSync(file, Buffer.from("%PDF-1.4 fixture ã"));
+      try {
+        const program = `ObjC.import('AppKit');
+function fail(code) { throw new Error(code); }
+${helper}
+var archive = webArchive('<div>Prose</div>', [{path: ${JSON.stringify(file)}, name: 'Q3 "final" <x>.pdf'}]);
+var plist = $.NSPropertyListSerialization.propertyListWithDataOptionsFormatError(archive, 0, null, null);
+var main = plist.objectForKey('WebMainResource');
+var html = ObjC.unwrap($.NSString.alloc.initWithDataEncoding(main.objectForKey('WebResourceData'), $.NSUTF8StringEncoding));
+var sub = plist.objectForKey('WebSubresources').objectAtIndex(0);
+var unarchiver = $.NSKeyedUnarchiver.alloc.initForReadingFromDataError(sub.objectForKey('WebResourceData'), null);
+unarchiver.requiresSecureCoding = false;
+var wrapper = unarchiver.decodeObjectForKey('root');
+JSON.stringify({
+  html: html,
+  mainType: ObjC.unwrap(main.objectForKey('WebResourceMIMEType')),
+  mainUrl: ObjC.unwrap(main.objectForKey('WebResourceURL')),
+  count: Number(plist.objectForKey('WebSubresources').count),
+  url: ObjC.unwrap(sub.objectForKey('WebResourceURL')),
+  type: ObjC.unwrap(sub.objectForKey('WebResourceMIMEType')),
+  name: ObjC.unwrap(wrapper.preferredFilename),
+  same: Boolean(wrapper.regularFileContents.isEqualToData($.NSData.dataWithContentsOfFile(${JSON.stringify(file)})))
+});`;
+        const { execFileSync } =
+          await vi.importActual<typeof import("node:child_process")>("node:child_process");
+        const result = JSON.parse(
+          execFileSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", program], {
+            encoding: "utf8",
+            timeout: 10000,
+          })
+        );
+        const id = /webkitattachmentid="([0-9A-F-]{36})"/.exec(result.html)?.[1];
+        expect(id).toBeDefined();
+        expect(result).toEqual({
+          html:
+            `<div>Prose</div><div><attachment webkitattachmentid="${id}" ` +
+            'title="Q3 &quot;final&quot; &lt;x&gt;.pdf" type="application/pdf"></attachment></div>',
+          mainType: "text/html",
+          mainUrl: "about:blank",
+          count: 1,
+          url: `applewebdata://attachment/${id}`,
+          type: "application/pdf",
+          name: 'Q3 "final" <x>.pdf',
+          same: true,
+        });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  );
+
+  describe("editor text is read in document order", () => {
+    type Node = { AXRole: string; AXValue?: string; kids?: Node[] };
+    const text = (value: string): Node => ({ AXRole: "AXStaticText", AXValue: value });
+    const group = (...kids: Node[]): Node => ({ AXRole: "AXGroup", kids });
+    const read = (root: Node) => {
+      insertNativeAuthoredBody(input);
+      const script: string = h.run.mock.calls[0][1][3];
+      const source =
+        script.slice(
+          script.indexOf("function descendants"),
+          script.indexOf("function findMarkedComposer")
+        ) + script.slice(script.indexOf("function bodyText"), script.indexOf("function address"));
+      const wrap = (node: Node): object => ({
+        node,
+        uiElements: () => (node.kids ?? []).map(wrap),
+      });
+      return runInNewContext(`${source}\nbodyText(root);`, {
+        root: wrap(root),
+        attr: (element: { node: Node }, key: string) =>
+          (element.node as Record<string, unknown>)[key] ?? null,
+        fail: (code: string) => {
+          throw new Error(code);
+        },
+      });
+    };
+
+    it("keeps a shallow quoted line after deeper prose that precedes it on the page", () => {
+      // Live 2026-11-09: a reply whose quote carries Mail's "<zz-test.txt>" placeholder
+      // one level shallower than the pasted prose. A breadth-first walk read the
+      // placeholder first and failed the prose-first readback.
+      const body = {
+        AXRole: "AXWebArea",
+        kids: [
+          group(
+            group(text("New prose.")),
+            group(text("Signature"), group(text("https://example.com")))
+          ),
+          group(text("Quoted line")),
+          text("<zz-test.txt>"),
+        ],
+      };
+      expect(read(body)).toBe(
+        "New prose.\nSignature\nhttps://example.com\nQuoted line\n<zz-test.txt>"
+      );
     });
   });
 
@@ -198,7 +517,9 @@ describe("native editor process contract (no live UI)", () => {
     expect(script).toContain("stage('post-cmd-up')");
     expect(script).toContain("if (Number(clipboard.changeCount) !== ownedCount) fail('clipboard')");
     expect(script).toContain("item.dataForType(type)");
-    expect(script).toContain("verifiedInsertion(beforeText, bodyText(body), input.body)");
+    expect(script).toContain(
+      "verifiedInsertion(beforeText, bodyText(body), input.body, files.length)"
+    );
     expect(script.match(/events\.keyCode\(9,/g)).toHaveLength(1);
     expect(script).not.toMatch(/\.send\(|set content|keyCode\(48|click\(\{/);
   });
@@ -412,12 +733,13 @@ JSON.stringify(result);`;
     nativeEditorPreflight();
     const script = h.run.mock.calls[0][1][3];
     const guard = script.slice(
-      script.indexOf("    if (ObjC.unwrap(clipboard.stringForType"),
-      script.indexOf("    stage('pre-cmd-up')")
+      script.indexOf("    if (prose && (ObjC.unwrap(clipboard.stringForType"),
+      script.indexOf("    if (archive) {")
     );
     expect(guard).toContain("fail('clipboard')");
     const run = () =>
       runInNewContext(guard, {
+        prose: true,
         ObjC: { unwrap: (value: unknown) => value },
         $: { NSPasteboardTypeHTML: "html", NSPasteboardTypeString: "text" },
         clipboard: { stringForType: (type: string) => (type === "html" ? html : text) },
@@ -575,6 +897,7 @@ JSON.stringify({count: Number(items.count), types: ObjC.deepUnwrap(item.types).s
     ["Old history", "New prose\nDifferent history", "New prose", false],
     ["Old history", "Old history\nNew prose", "New prose", false],
     ["", "New prose", "New prose", true],
+    ["Old \uFFFC history", "New prose\nOld \uFFFC history", "New prose", true],
   ])(
     "verifies exact authored prefix and unchanged native suffix",
     (before, after, authored, expected) => {
@@ -594,19 +917,57 @@ JSON.stringify({count: Number(items.count), types: ObjC.deepUnwrap(item.types).s
     }
   );
 
-  it.each(["", "   \n"])("leaves native history untouched when a forward has no prose", (body) => {
-    insertNativeAuthoredBody(input);
-    const script = h.run.mock.calls[0][1][3];
-    const start = script.indexOf("if (!normalized(input.body)) return;");
-    const guard = script.slice(start, script.indexOf("var beforeText", start));
-    expect(start).toBeGreaterThan(script.indexOf("checkFocus();"));
-    expect(start).toBeLessThan(script.indexOf("stage('clipboard-snapshot')"));
-    const result = runInNewContext(`(function(){${guard}; return 'would-insert';})()`, {
-      input: { body },
-      normalized: (s: string) => s.trim(),
-    });
-    expect(result).toBeUndefined();
-  });
+  it.each([
+    ["Prose\n\uFFFC\nSignature\nOld history", "Prose", true, "files between prose and history"],
+    ["Prose report.pdf 2.4 MB Signature Old history", "Prose", true, "a file label"],
+    ["\uFFFC\nSignature\nOld history", "", true, "attachments without prose"],
+    ["Prose\n\uFFFC\nSignature", "Prose", false, "quoted history erased"],
+    ["Prose\n\uFFFC", "Prose", false, "signature and history erased"],
+    ["\uFFFC\nSignature\nOld history", "Prose", false, "prose missing"],
+    ["Signature Old history Prose \uFFFC", "Prose", false, "prose below history"],
+  ])(
+    "verifies prose first and unchanged native content last around attachments: %s",
+    (after, authored, expected) => {
+      insertNativeAuthoredBody(input);
+      const script = h.run.mock.calls[0][1][3];
+      const logic = script.slice(
+        script.indexOf("function normalized"),
+        script.indexOf("function address")
+      );
+      expect(
+        runInNewContext(logic + ";verifiedInsertion(before, after, authored, 1)", {
+          before: "Signature\nOld history",
+          after,
+          authored,
+        })
+      ).toBe(expected);
+    }
+  );
+
+  it.each([
+    ["", 0, undefined],
+    ["   \n", 0, undefined],
+    ["", 1, "would-insert"],
+    ["Prose", 0, "would-insert"],
+  ])(
+    "leaves native history untouched only when there is neither prose nor a file (%j, %d files)",
+    (body, files, expected) => {
+      insertNativeAuthoredBody(input);
+      const script = h.run.mock.calls[0][1][3];
+      const start = script.indexOf("var files = ");
+      const guard = script.slice(start, script.indexOf("var beforeText", start));
+      expect(start).toBeGreaterThan(script.indexOf("checkFocus();"));
+      expect(start).toBeLessThan(script.indexOf("stage('clipboard-snapshot')"));
+      const result = runInNewContext(`(function(){${guard}; return 'would-insert';})()`, {
+        input: {
+          body,
+          attachments: Array.from({ length: files }, () => ({ path: "/a", name: "a" })),
+        },
+        normalized: (s: string) => s.trim(),
+      });
+      expect(result).toBe(expected);
+    }
+  );
 
   it.each([
     "accessibility",

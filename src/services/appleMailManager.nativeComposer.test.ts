@@ -313,12 +313,50 @@ describe("native editor compose orchestration", () => {
     expect(h.calls.some((c) => c.script.includes("make new outgoing message"))).toBe(false);
   });
 
-  it("appends attachments only after paste and checks the original-plus-added count", () => {
+  const draftWithFile = (manager: AppleMailManager, kind: string) => {
+    const files = [{ filename: "note.txt", contentBase64: "aGVsbG8=" }];
+    return kind === "new"
+      ? manager.createDraft([], "s", "b", undefined, undefined, "Work", files, true)
+      : kind === "reply"
+        ? manager.replyToMessage("42", "b", false, false, files, true)
+        : manager.forwardMessage("42", ["to@example.com"], "b", false, files, true);
+  };
+
+  it.each(["new", "reply", "forward"])(
+    "hands a native %s draft's files to the editor paste and never scripts an attachment",
+    (kind) => {
+      expect(draftWithFile(manager, kind).success).toBe(true);
+      // Writing Mail's scripting content (attachments included) re-renders the
+      // HTML body and erases the pasted prose and the quoted history.
+      for (const call of h.calls) expect(call.script).not.toContain("make new attachment");
+      expect(creation()).not.toMatch(/content:|set content|attachments of content/);
+      const [inserted] = h.insert.mock.calls[0];
+      expect(inserted.attachments).toHaveLength(1);
+      expect(inserted.attachments[0]).toMatch(/^\/.*\/note\.txt$/);
+      // Mail's scripting attachment count cannot see pasted files (the bridge
+      // checks the editor's accessibility tree), so finalization never reads it.
+      const script = finalization();
+      expect(script).not.toMatch(/content:|set content|tell _nativeMessage|attachments of content/);
+      expect(script).not.toContain("_nativeExpectedAttachments");
+      expect(script.match(/Native compose recipients changed/g)).toHaveLength(1);
+    }
+  );
+
+  it("does not finalize when the bridge reports the files did not arrive", () => {
+    h.insert.mockReturnValue({ success: false, error: "The pasted attachments did not appear" });
+    expect(draftWithFile(manager, "reply")).toEqual({
+      success: false,
+      error: "The pasted attachments did not appear",
+    });
+    expect(h.calls.some((c) => c.script.includes('return "native-finalized"'))).toBe(false);
+  });
+
+  it("sends a native message with only files through the same paste", () => {
     expect(
-      manager.createDraft(
-        [],
-        "s",
-        "b",
+      manager.sendEmail(
+        ["to@example.com"],
+        "Subject",
+        "",
         undefined,
         undefined,
         "Work",
@@ -326,13 +364,19 @@ describe("native editor compose orchestration", () => {
         true
       ).success
     ).toBe(true);
-    expect(creation()).not.toContain("make new attachment");
+    expect(h.insert.mock.calls[0][0]).toMatchObject({
+      body: "",
+      attachments: [expect.any(String)],
+    });
     const script = finalization();
-    expect(script).toContain("make new attachment");
-    expect(script).toContain("(count of attachments of content of _nativeMessage) + 1");
-    expect(script).toContain("attachCount >= _nativeExpectedAttachments");
-    expect(script).toContain("if attachCount < _nativeExpectedAttachments then error");
-    expect(script).not.toMatch(/content:|set content/);
-    expect(script.match(/Native compose recipients changed/g)).toHaveLength(2);
+    expect(script).not.toContain("make new attachment");
+    expect(script).not.toContain("attachments of content");
+    expect(script.match(/send _nativeMessage/g)).toHaveLength(1);
+  });
+
+  it("leaves attachment-free native scripts without an attachment check", () => {
+    send(manager);
+    expect(h.insert.mock.calls[0][0]).not.toHaveProperty("attachments");
+    expect(finalization()).not.toContain("attachments of content");
   });
 });

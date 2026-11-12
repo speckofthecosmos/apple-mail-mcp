@@ -4745,8 +4745,9 @@ ${indent}end try${this.sanitizeFragment("_uacct", indent)}${this.sanitizeFragmen
   }
 
   /**
-   * Native editor transaction: create once, paste only the authored HTML, then
-   * re-identify and finalize once. Any failure leaves the compose for inspection.
+   * Native editor transaction: create once, paste only the authored HTML (and
+   * any attachments, in the same paste), then re-identify and finalize once.
+   * Any failure leaves the compose for inspection.
    * Neither creation nor finalization assigns Mail's body/content property.
    */
   private composeNative(
@@ -4785,15 +4786,6 @@ ${indent}end try${this.sanitizeFragment("_uacct", indent)}${this.sanitizeFragmen
     // Materialize and policy-check every attachment before creating any compose.
     const mat = materializeAttachments(attachments);
     try {
-      const appendCommands = buildAttachmentCommands(mat.paths);
-      const attachmentCommands = mat.paths.length
-        ? `set _nativeExpectedAttachments to (count of attachments of content of _nativeMessage) + ${mat.paths.length}
-          tell _nativeMessage
-            ${appendCommands}
-          end tell
-          ${attachmentSettleBlock("_nativeMessage", mat.paths.length).replace(`attachCount >= ${mat.paths.length}`, "attachCount >= _nativeExpectedAttachments")}
-          if attachCount < _nativeExpectedAttachments then error "Native attachments did not finish loading; compose retained."`
-        : "";
       const marker = `MCP Native ${randomUUID()}`;
       const endMarker = `:native-end:${randomUUID()}`;
       const safeMarker = escapeForAppleScript(marker);
@@ -4860,12 +4852,20 @@ ${indent}end try${this.sanitizeFragment("_uacct", indent)}${this.sanitizeFragmen
           error: "Native compose returned an invalid identity; compose retained for inspection.",
         };
       }
+      // Files are pasted by the editor bridge together with the prose. Never
+      // `make new attachment` here: any write to an outgoing message's scripting
+      // `content` (attachments included) re-renders the whole HTML body from
+      // Mail's quote-less text storage, erasing the pasted prose and, on a
+      // reply or forward, Mail's quoted history.
       const inserted = insertNativeAuthoredBody({
         messageId,
         markerSubject: marker,
         body,
         expectedSender,
+        ...(mat.paths.length ? { attachments: mat.paths } : {}),
       });
+      // The bridge also waits for each file to appear in the editor. Mail's
+      // scripting attachment count cannot see pasted files, so it is not read.
       if (!inserted.success) return inserted;
 
       const guard = `set _nativeMatches to (every outgoing message whose id is ${messageId})
@@ -4879,8 +4879,6 @@ ${indent}end try${this.sanitizeFragment("_uacct", indent)}${this.sanitizeFragmen
       const finalized = executeAppleScript(
         buildAppLevelScript(`try
         ${guard}
-        ${attachmentCommands}
-        ${mat.paths.length ? guard : ""}
         set subject of _nativeMessage to (${nativeTextLiteral(originalSubject)})
         ${mode === "send" ? 'set _nativeSent to send _nativeMessage\nif _nativeSent is not true then error "Mail did not accept the native send; inspect the compose before retrying."' : draftSaveBlock("_nativeMessage")}
         return "native-finalized"

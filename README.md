@@ -126,7 +126,10 @@ through Mail's visible editor, leaving its signature and reply history intact.
 This opt-in path uses existing macOS Accessibility and Automation permissions;
 it does not require a separate computer-control plugin. It verifies the composer
 and sender, preserves the clipboard, and stops without sending if insertion
-cannot be verified. See [native composition](docs/NATIVE-COMPOSITION.md) for
+cannot be verified. Attachments are pasted through the same editor, below the
+new prose. Each editor run is bounded at 60 s plus 5 s per attachment;
+`APPLE_MAIL_MCP_NATIVE_EDITOR_TIMEOUT_MS` (minimum `15000`) changes the base.
+See [native composition](docs/NATIVE-COMPOSITION.md) for
 setup, examples, and verification limits. Existing SMTP and AppleScript behavior
 is unchanged when the option is omitted.
 

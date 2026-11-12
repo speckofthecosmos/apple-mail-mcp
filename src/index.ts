@@ -1540,7 +1540,8 @@ const COMPOSITION_SCHEMA = z
   .literal("native-editor")
   .optional()
   .describe(
-    "Opt in to Mail's visible native editor: inserts only new prose, preserving its signature, " +
+    "Opt in to Mail's visible native editor: inserts only new prose (and any attachments, pasted " +
+      "below it), preserving its signature, " +
       "HTML quotation and reply ancestry without the AppleScript content setter. Requires an unlocked " +
       "desktop and existing Accessibility and Automation permissions. Uses Mail.app even when SMTP " +
       "is configured; cannot be combined with transport=smtp or caller-built threading headers. " +
